@@ -25,33 +25,37 @@ export const PROVIDER_LABEL = PROVIDER === "gemini" ? "Gemini" : PROVIDER === "o
 export const MODEL_ID =
   PROVIDER === "gemini" ? process.env.GEMINI_MODEL || "gemini-3.5-flash-lite" : process.env.OPENAI_MODEL || "gpt-5.4-mini";
 
-/** Double-checks answer keys. A different, stronger model makes the check more independent (fewer requests/day on the free tier). */
-export const CHECK_MODEL_ID =
-  PROVIDER === "gemini" ? process.env.GEMINI_CHECK_MODEL || "gemini-3.8-flash" : process.env.OPENAI_CHECK_MODEL || MODEL_ID;
+/**
+ * Double-check answer keys, tried in order. Different models from the writer keep the check independent.
+ * Measured on the free tier (2026-11-24): 3.6 Flash ≈11 s, 3.1 Flash-Lite ≈3 s; 3.8 Flash timed out under load.
+ */
+export const CHECK_MODEL_IDS: string[] = [
+  ...new Set(
+    PROVIDER === "gemini"
+      ? [process.env.GEMINI_CHECK_MODEL || "gemini-3.6-flash", "gemini-3.1-flash-lite"]
+      : [process.env.OPENAI_CHECK_MODEL || MODEL_ID],
+  ),
+];
 
 const gemini = createGoogleGenerativeAI({ apiKey: geminiKey });
 const openai = createOpenAI({ apiKey: openaiKey });
 
-/** "main" for everything; "check" only for the answer double-check, with its own pause so one can't block the other. */
-export type Lane = "main" | "check";
-
-export function model(lane: Lane = "main") {
-  const id = lane === "check" ? CHECK_MODEL_ID : MODEL_ID;
+export function model(id: string = MODEL_ID) {
   return PROVIDER === "gemini" ? gemini(id) : openai(id);
 }
 
 /** Short label stored next to AI-written questions, e.g. "Gemini · gemini-3.5-flash-lite". */
-export const MODEL_LABEL = `${PROVIDER_LABEL} · ${MODEL_ID}`;
-export const CHECK_MODEL_LABEL = `${PROVIDER_LABEL} · ${CHECK_MODEL_ID}`;
+export const modelLabel = (id: string = MODEL_ID) => `${PROVIDER_LABEL} · ${id}`;
+export const MODEL_LABEL = modelLabel();
 
-/* ───────── Circuit breaker ─────────
-   When the provider rejects us for account reasons (no credits, bad key, quota), skip AI for a while and serve
-   fallbacks instantly instead of making students wait. Per-minute limits (common on free tiers) pause briefly. */
-const globalForAi = globalThis as unknown as { aiPause?: Partial<Record<Lane, { until: number; reason: string }>> };
-const pauses = (globalForAi.aiPause ??= {});
+/* ───────── Circuit breaker (per model) ─────────
+   When the provider rejects us for account reasons (no credits, bad key, quota), skip that model for a while and
+   serve fallbacks instantly instead of making students wait. Rate limits and "high demand" pause briefly. */
+const globalForAi = globalThis as unknown as { aiPause?: Map<string, { until: number; reason: string }> };
+const pauses = (globalForAi.aiPause ??= new Map());
 
-export function aiAvailable(lane: Lane = "main") {
-  return PROVIDER !== null && (pauses[lane]?.until ?? 0) < Date.now();
+export function aiAvailable(id: string = MODEL_ID) {
+  return PROVIDER !== null && (pauses.get(id)?.until ?? 0) < Date.now();
 }
 
 function classify(text: string): { reason: string; pauseMs: number } | null {
@@ -61,30 +65,31 @@ function classify(text: string): { reason: string; pauseMs: number } | null {
   if (/PerDay|per day|daily/i.test(text) && /quota|RESOURCE_EXHAUSTED|429/i.test(text))
     return { reason: `${PROVIDER_LABEL} daily free quota used up`, pauseMs: 30 * 60_000 };
   if (/RESOURCE_EXHAUSTED|rate_limit|quota|\b429\b/i.test(text)) return { reason: `${PROVIDER_LABEL} rate limit reached`, pauseMs: 60_000 };
+  if (/high demand|overloaded|UNAVAILABLE|\b503\b/i.test(text)) return { reason: `${PROVIDER_LABEL} is busy right now`, pauseMs: 3 * 60_000 };
   if (/model.*not found|NOT_FOUND|\b404\b/i.test(text)) return { reason: `${PROVIDER_LABEL} model not found — check GEMINI_MODEL / OPENAI_MODEL`, pauseMs: 5 * 60_000 };
   return null;
 }
 
-export function reportAiFailure(error: unknown, lane: Lane = "main") {
+export function reportAiFailure(error: unknown, id: string = MODEL_ID) {
   const text = JSON.stringify(error, Object.getOwnPropertyNames(error ?? {})) ?? String(error);
-  const problem = classify(text);
+  const problem = classify(text) ?? (/timeout|aborted/i.test(text) ? { reason: `${PROVIDER_LABEL} is responding slowly`, pauseMs: 3 * 60_000 } : null);
   if (problem) {
-    pauses[lane] = { until: Date.now() + problem.pauseMs, reason: problem.reason };
-    console.warn(`[ai:${lane}] ${problem.reason} — paused for ${Math.round(problem.pauseMs / 60_000)} min.`);
+    pauses.set(id, { until: Date.now() + problem.pauseMs, reason: problem.reason });
+    console.warn(`[ai:${id}] ${problem.reason} — skipped for ${Math.round(problem.pauseMs / 60_000)} min.`);
   } else {
-    console.error(`[ai:${lane}] request failed:`, error instanceof Error ? error.message : error);
+    console.error(`[ai:${id}] request failed:`, error instanceof Error ? error.message : error);
   }
 }
 
 export function aiStatus() {
   const available = aiAvailable();
-  const pause = pauses.main;
+  const pause = pauses.get(MODEL_ID);
   return {
     configured: PROVIDER !== null,
     available,
     provider: PROVIDER_LABEL,
     model: PROVIDER ? MODEL_ID : null,
-    checkModel: PROVIDER ? CHECK_MODEL_ID : null,
+    checkModel: PROVIDER ? (CHECK_MODEL_IDS.find((id) => aiAvailable(id)) ?? null) : null,
     reason: available ? null : (pause?.reason ?? (PROVIDER ? null : "No AI key configured")),
     pausedUntil: available ? null : (pause?.until ?? null),
   };

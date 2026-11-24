@@ -134,7 +134,8 @@ function AiStatusLine({ ai }: { ai: ReturnType<typeof aiStatus> }) {
       <p className="mb-5 flex items-center gap-2 text-sm text-muted-foreground">
         <span className="size-2 rounded-full bg-success" aria-hidden />
         <span>
-          <span className="font-medium text-foreground">{ai.provider}</span> · {ai.model} is ready. Questions it writes for student tests also land here.
+          <span className="font-medium text-foreground">{ai.provider}</span> is ready · {ai.model} writes
+          {ai.checkModel && ai.checkModel !== ai.model ? `, ${ai.checkModel} double-checks` : ""}. Questions written for student tests also land here.
         </span>
       </p>
     );

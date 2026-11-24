@@ -1,6 +1,6 @@
 import "server-only";
 import { aiStatus } from "@/lib/ai/model";
-import { mapToSyllabus, questionKey, type OutsideQuestion } from "@/lib/ai/questions";
+import { mapToSyllabus, questionKey, tidyMath, type OutsideQuestion } from "@/lib/ai/questions";
 import { getCatalog } from "@/lib/catalog/server";
 import { subjectName } from "@/lib/catalog/shared";
 import { db } from "@/lib/db";
@@ -232,9 +232,11 @@ export async function importFromDataset(opts: { datasetId: string; syllabusId: s
   const raw = ds.source.kind === "hf" ? await fetchHf(ds.source, want) : await fetchTrivia(ds.source, want);
   const existing = await db.select({ text: bankQuestions.text }).from(bankQuestions).where(eq(bankQuestions.subjectSlug, syllabus.subjectSlug));
   const seen = new Set(existing.map((e) => questionKey(e.text)));
+  const tidy = tidyMath(syllabus.subjectSlug);
   const fresh: OutsideQuestion[] = [];
   for (const q of raw) {
-    const four = toFour(q);
+    // Datasets often write maths in LaTeX ("\frac{5}{8}", "$x^2$"); students see plain text.
+    const four = toFour({ ...q, text: tidy(q.text), options: q.options.map((o) => tidy(String(o))) });
     if (!four) continue;
     const key = questionKey(four.text);
     if (seen.has(key)) continue;
@@ -245,7 +247,7 @@ export async function importFromDataset(opts: { datasetId: string; syllabusId: s
 
   // Match to chapters in batches of 25 (in parallel — a few requests, well inside free-tier limits).
   const name = subjectName(cat, syllabus.subjectSlug);
-  const ctx = { subjectName: name, audience: course?.audience ?? `students following “${syllabus.title}”`, chapters: syllabus.chapters.map((c) => c.name) };
+  const ctx = { subject: syllabus.subjectSlug, subjectName: name, audience: course?.audience ?? `students following “${syllabus.title}”`, chapters: syllabus.chapters.map((c) => c.name) };
   const batches: OutsideQuestion[][] = [];
   for (let i = 0; i < fresh.length; i += 25) batches.push(fresh.slice(i, i + 25));
   const mapped = (await Promise.all(batches.map((b) => mapToSyllabus(b, ctx)))).flat();

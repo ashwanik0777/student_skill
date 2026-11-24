@@ -1,9 +1,10 @@
 import "server-only";
 import { generateText, Output } from "ai";
 import { z } from "zod";
+import { plainMath } from "@/lib/plain-math";
 import type { Difficulty, QuestionWithAnswer } from "@/lib/types";
 import { shuffle } from "@/lib/utils";
-import { BASE_INSTRUCTIONS, CHECK_MODEL_LABEL, MODEL_LABEL, aiAvailable, model, reportAiFailure, type Lane } from "./model";
+import { BASE_INSTRUCTIONS, CHECK_MODEL_IDS, MODEL_ID, aiAvailable, model, modelLabel, reportAiFailure } from "./model";
 
 const questionSchema = z.object({
   chapter: z.string().describe("Exact chapter name from the provided list"),
@@ -44,6 +45,10 @@ export function questionKey(text: string) {
     .trim()
     .slice(0, 90);
 }
+
+/** Students read plain text: no LaTeX, carets or underscores. */
+const FORMAT_RULE =
+  "Formatting: write symbols, powers, subscripts and units in Unicode — E₀, B₀, 4.0 × 10⁻⁷ T, m/s², H₂SO₄, √2, π, θ, ≤, °C, ₹ — never LaTeX ($…$, \\frac), ^ or _.";
 
 function difficultyLine(d: GenerateRequest["difficulty"]) {
   switch (d) {
@@ -97,8 +102,12 @@ function subjectStyle(subject: string) {
   }
 }
 
+/** Plain-text maths for everything except programming, where ^ and _ are real syntax. */
+export const tidyMath = (subject: string) => (s: string) => (subject === "computer" ? s : plainMath(s));
+
 function normalise(raw: z.infer<typeof questionSchema>, req: GenerateRequest): QuestionWithAnswer | null {
-  const options = raw.options.map((o) => o.replace(/^\s*(\(?[A-Da-d][).:]|[A-Da-d]\s*-)\s+/, "").trim()).filter(Boolean);
+  const tidy = tidyMath(req.subject);
+  const options = raw.options.map((o) => tidy(o.replace(/^\s*(\(?[A-Da-d][).:]|[A-Da-d]\s*-)\s+/, "").trim())).filter(Boolean);
   if (options.length !== 4) return null;
   if (new Set(options.map((o) => o.toLowerCase())).size !== 4) return null;
   if (!Number.isInteger(raw.correctIndex) || raw.correctIndex < 0 || raw.correctIndex > 3) return null;
@@ -113,10 +122,10 @@ function normalise(raw: z.infer<typeof questionSchema>, req: GenerateRequest): Q
     subject: req.subject,
     chapter,
     topic: raw.topic.trim().slice(0, 80) || chapter,
-    text: raw.text.trim(),
+    text: tidy(raw.text.trim()),
     options: shuffled,
     correctIndex: shuffled.indexOf(correctText),
-    explanation: raw.explanation.trim(),
+    explanation: tidy(raw.explanation.trim()),
     difficulty: raw.difficulty,
   };
 }
@@ -141,6 +150,7 @@ export async function generateQuestions(req: GenerateRequest): Promise<QuestionW
       : "",
     subjectStyle(req.subject),
     `Rules: exactly 4 options each, exactly one correct; options similar in length and plausible; never use "All of the above", "None of the above" or refer to other options by letter; no trick wording; each question must be self-contained.`,
+    FORMAT_RULE,
     req.avoid?.length
       ? `These questions already exist — do not repeat them or ask the same thing in other words:\n${req.avoid.map((t) => `- ${t.slice(0, 140)}`).join("\n")}`
       : "",
@@ -203,21 +213,22 @@ export async function checkAnswers(items: CheckInput[]): Promise<(CheckResult | 
     "",
     ...items.map((q, i) => [`Q${i + 1} (${q.subjectName}). ${q.text}`, ...q.options.map((o, j) => `  ${j}) ${o}`)].join("\n")),
   ].join("\n");
-  // Prefer the dedicated checking model; if it is paused (its free quota is small), fall back to the main one.
-  const lanes: Lane[] = (["check", "main"] as const).filter((l) => aiAvailable(l));
-  for (const lane of lanes) {
+  // Checking models first (independent of the writer); the writer itself only as a last resort.
+  const ids = [...new Set([...CHECK_MODEL_IDS, MODEL_ID])].filter((id) => aiAvailable(id));
+  for (const id of ids) {
     try {
       const { output } = await generateText({
-        model: model(lane),
+        model: model(id),
         instructions: BASE_INSTRUCTIONS,
         prompt,
         output: Output.object({ schema: checkSchema }),
         reasoning: "medium",
-        abortSignal: AbortSignal.timeout(120_000),
-        maxRetries: 1,
+        // Fail over quickly: the next model is usually faster than waiting on a busy one.
+        abortSignal: AbortSignal.timeout(60_000),
+        maxRetries: 0,
       });
       const at = new Date().toISOString();
-      const label = lane === "check" ? CHECK_MODEL_LABEL : MODEL_LABEL;
+      const label = modelLabel(id);
       const byN = new Map(output.answers.map((a) => [a.n, a]));
       return items.map((q, i) => {
         const a = byN.get(i + 1);
@@ -226,7 +237,7 @@ export async function checkAnswers(items: CheckInput[]): Promise<(CheckResult | 
         return { picked: a.picked, agrees: a.picked === q.correctIndex && !note, note: note || undefined, model: label, at };
       });
     } catch (error) {
-      reportAiFailure(error, lane);
+      reportAiFailure(error, id);
     }
   }
   return items.map(() => null);
@@ -258,7 +269,7 @@ export type MappedQuestion = { chapter: string; topic: string; difficulty: Diffi
  */
 export async function mapToSyllabus(
   items: OutsideQuestion[],
-  ctx: { subjectName: string; audience: string; chapters: string[] },
+  ctx: { subject: string; subjectName: string; audience: string; chapters: string[] },
 ): Promise<(MappedQuestion | null)[]> {
   if (!aiAvailable() || items.length === 0) return items.map(() => null);
   const prompt = [
@@ -266,6 +277,7 @@ export async function mapToSyllabus(
     `Chapters (use these exact names): ${ctx.chapters.join(" | ")}.`,
     'Use "none" when no chapter is a good fit. Mark suitable=false for anything that needs a missing figure, is about the USA/Europe specifically, is ambiguous, or is far above or below this level.',
     "Write the explanation for an Indian student, in the language of the question.",
+    FORMAT_RULE,
     "",
     ...items.map((q, i) =>
       [`Q${i + 1}. ${q.text}`, ...q.options.map((o, j) => `  ${j}) ${o}${j === q.correctIndex ? "   ← correct" : ""}`), q.hint ? `  Worked solution: ${q.hint.slice(0, 600)}` : ""]
@@ -289,7 +301,7 @@ export async function mapToSyllabus(
       const a = byN.get(i + 1);
       const chapter = a && names.get(a.chapter.trim().toLowerCase());
       if (!a || !a.suitable || !chapter || !a.explanation.trim()) return null;
-      return { chapter, topic: a.topic.trim().slice(0, 80) || chapter, difficulty: a.difficulty, explanation: a.explanation.trim() };
+      return { chapter, topic: a.topic.trim().slice(0, 80) || chapter, difficulty: a.difficulty, explanation: tidyMath(ctx.subject)(a.explanation.trim()) };
     });
   } catch (error) {
     reportAiFailure(error);
