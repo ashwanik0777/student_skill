@@ -1,14 +1,15 @@
+import { loadEnvConfig } from "@next/env";
 import { defineConfig } from "drizzle-kit";
 
-if (!process.env.DATABASE_URL) {
-  throw new Error("DATABASE_URL, ensure the database is provisioned");
-}
+loadEnvConfig(process.cwd());
 
 export default defineConfig({
-  out: "./migrations",
-  schema: "./shared/schema.ts",
+  schema: "./src/lib/db/schema.ts",
+  out: "./drizzle",
   dialect: "postgresql",
   dbCredentials: {
-    url: process.env.DATABASE_URL,
+    url: process.env.DATABASE_URL!,
   },
+  strict: true,
+  verbose: true,
 });
